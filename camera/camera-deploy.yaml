@@ -1,0 +1,188 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: camera-livetrack
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: camera-livetrack
+  template:
+    metadata:
+      labels:
+        app: camera-livetrack
+    spec:
+      # Pin to the camera node via label
+      nodeSelector:
+        kubernetes.io/hostname: child2
+
+      containers:
+      - name: camera-container
+        image: ubuntu:20.04
+        command:
+          - bash
+          - -c
+          - |
+            apt-get update && \
+            apt-get install -y ffmpeg netcat bsdmainutils && \
+            RECEIVER_IP=$(hostname -i) && \
+            echo "Camera waiting for receiver at $RECEIVER_IP:12345..."
+
+            LOG_SENT=0
+
+            while true; do
+              if nc -z $RECEIVER_IP 12345 && [ -f /shared/trigger_camera ] && grep -q "1" /shared/trigger_camera; then
+                if [ "$LOG_SENT" -eq 0 ]; then
+                  echo "Receiver is ready and trigger is 1. Starting stream..."
+
+                  TIMESTAMP=$(date +%s)
+                  ffmpeg -f v4l2 -i /dev/video0 -vf "fps=1" -vframes 5 -f image2pipe - \
+                    2>/pcap/ffmpeg-$(hostname)-$TIMESTAMP.log | \
+                    hexdump -C | nc -N $RECEIVER_IP 12345
+
+                  echo "Transmission complete. Log created."
+                  LOG_SENT=1
+                else
+                  echo "Log already created. Skipping..."
+                fi
+              else
+                LOG_SENT=0  # Reset when trigger is removed or receiver is not ready
+              fi
+              sleep 1
+            done
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - mountPath: /dev/video0
+            name: video0
+            readOnly: false
+          - mountPath: /pcap
+            name: pcap-pv
+          - mountPath: /shared
+            name: shared-data
+
+      - name: receiver-container
+        image: ubuntu:20.04
+        command:
+          - bash
+          - -c
+          - |
+            apt-get update && \
+            apt-get install -y netcat && \
+            echo "Receiver ready." && \
+            while true; do \
+              if [ -f /shared/trigger_camera ] && grep -q "1" /shared/trigger_camera; then \
+                echo "Trigger is 1 — starting receiver..."; \
+                nc -lkp 12345 > /pcap/received_hex-$(hostname)-$(date +%s).txt & \
+                NC_PID=$!; \
+                while [ -f /shared/trigger_camera ] && grep -q "1" /shared/trigger_camera; do sleep 1; done; \
+                echo "Trigger removed — stopping receiver..."; \
+                kill $NC_PID 2>/dev/null; \
+                wait $NC_PID 2>/dev/null; \
+              else \
+                sleep 1; \
+              fi; \
+            done
+        volumeMounts:
+          - name: pcap-pv
+            mountPath: /pcap
+          - name: shared-data
+            mountPath: /shared
+
+      - name: zeek-sidecar
+        image: blacktop/zeek:latest
+        securityContext:
+          privileged: true
+        env:
+          - name: ZEEK_LOG_OUTPUT_DIR
+            value: /pcap/zeek-logs-camera
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "[zeek] Waiting for trigger file to start live capture..."
+            mkdir -p /pcap/zeek-logs-camera
+            echo "created directory"
+            cd /pcap/zeek-logs-camera
+            while true; do
+              if [ -f /shared/trigger_camera ]; then
+                echo "[zeek] Trigger found. Starting Zeek live capture..."
+                zeek -i any &
+                PID=$!
+                echo "[zeek] Zeek started with PID $PID"
+                while [ -f /shared/trigger_camera ]; do sleep 1; done
+                echo "[zeek] Trigger removed. Stopping Zeek..."
+                kill $PID || echo "[zeek] kill failed or already stopped"
+              else
+                sleep 1
+              fi
+            done
+        volumeMounts:
+          - name: pcap-pv
+            mountPath: /pcap
+          - name: shared-data
+            mountPath: /shared
+
+      - name: tcpdump-sidecar
+        image: alpine:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            apk add --no-cache tcpdump;
+            echo "[tcpdump] Waiting for trigger file..."
+            while true; do
+              if [ -f /shared/trigger_camera ]; then
+                echo "[tcpdump] Trigger found. Starting capture..."
+                tcpdump -i any -w /pcap/pod-camera-tcp.pcapng &
+                PID=$!
+                while [ -f /shared/trigger_camera ]; do sleep 1; done
+                echo "[tcpdump] Trigger removed. Stopping capture..."
+                kill $PID
+              else
+                sleep 1
+              fi
+            done
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - name: pcap-pv
+            mountPath: /pcap
+          - name: shared-data
+            mountPath: /shared
+
+      - name: ptcpdump-sidecar
+        image: quay.io/ptcpdump/ptcpdump:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "[ptcpdump] Waiting for trigger file..."
+            while true; do
+              if [ -f /shared/trigger_camera ]; then
+                echo "[ptcpdump] Starting capture..."
+                ptcpdump -i any -v -w /pcap/pod-camera-ptcp.pcapng &
+                PID=$!
+                echo "[ptcpdump] Started capture with PID $PID"
+                while [ -f /shared/trigger_camera ]; do sleep 1; done
+                echo "[ptcpdump] Trigger removed. Stopping capture..."
+                kill $PID
+              else
+                sleep 1
+              fi
+            done
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - name: pcap-pv
+            mountPath: /pcap
+          - name: shared-data
+            mountPath: /shared
+
+      volumes:
+        - name: video0
+          hostPath:
+            path: /dev/video0
+            type: CharDevice
+        - name: pcap-pv
+          persistentVolumeClaim:
+            claimName: pcap-pvc
+        - name: shared-data
+          emptyDir: {}

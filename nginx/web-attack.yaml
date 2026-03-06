@@ -1,0 +1,118 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traffic-gen-script
+data:
+  traffic_gen.py: |
+    import os, time, random, json
+    import requests
+
+    target = os.getenv("TARGET_URL", "http://nginx-service/")
+    min_sleep = float(os.getenv("MIN_SLEEP_SECONDS", "0.2"))
+    max_sleep = float(os.getenv("MAX_SLEEP_SECONDS", "1.5"))
+
+    # A small amount of "natural" noise
+    paths = [
+      "/", "/index.html", "/favicon.ico", "/robots.txt",
+      "/does-not-exist", "/healthz", "/about", "/contact"
+    ]
+    user_agents = [
+      "Mozilla/5.0 (X11; Linux x86_64)",
+      "curl/8.x",
+      "python-requests/2.x",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+    ]
+
+    session = requests.Session()
+    timeout = float(os.getenv("HTTP_TIMEOUT_SECONDS", "2.0"))
+
+    def log(evt: dict):
+      evt["ts"] = time.time()
+      print(json.dumps(evt), flush=True)
+
+    log({"event": "start", "target": target})
+
+    while True:
+      path = random.choice(paths)
+      url = target.rstrip("/") + path
+      headers = {"User-Agent": random.choice(user_agents)}
+
+      start = time.time()
+      try:
+        r = session.get(url, headers=headers, timeout=timeout)
+        log({
+          "event": "request",
+          "method": "GET",
+          "path": path,
+          "status": r.status_code,
+          "latency_ms": int((time.time() - start) * 1000),
+          "bytes": len(r.content),
+        })
+      except Exception as e:
+        log({
+          "event": "error",
+          "method": "GET",
+          "path": path,
+          "error": str(e),
+          "latency_ms": int((time.time() - start) * 1000),
+        })
+
+      time.sleep(random.uniform(min_sleep, max_sleep))
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-gen
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: traffic-gen
+  template:
+    metadata:
+      labels:
+        app: traffic-gen
+    spec:
+
+      # Encourage spreading across nodes when you scale or copy the deployment
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: traffic-gen
+
+      containers:
+        - name: traffic-gen
+          image: python:3.11-slim
+          env:
+            - name: TARGET_URL
+              value: "http://nginx-service/"
+            - name: MIN_SLEEP_SECONDS
+              value: "0.2"
+            - name: MAX_SLEEP_SECONDS
+              value: "1.5"
+            - name: HTTP_TIMEOUT_SECONDS
+              value: "2.0"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eu
+              pip install --no-cache-dir requests >/dev/null
+              python -u /app/traffic_gen.py
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+      volumes:
+        - name: script
+          configMap:
+            name: traffic-gen-script

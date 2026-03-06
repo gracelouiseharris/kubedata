@@ -1,0 +1,166 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: zeek-daemon
+  labels:
+    app: zeek
+spec:
+  selector:
+    matchLabels:
+      app: zeek
+  template:
+    metadata:
+      labels:
+        app: zeek
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: "Exists"
+      containers:
+        - name: zeek
+          image: zeek/zeek:latest
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ZEEK_LOG_BASE_DIR
+              value: /pcap
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[zeek] Detecting available Calico interfaces..."
+              apt-get update && apt-get install -y iproute2
+              ip link show | grep -E "cni0|vxlan.calico|tunl0" || true
+
+              IFACES=""
+              for CAND in cni0 vxlan.calico tunl0; do
+                if ip link show $CAND 2>/dev/null | grep -q "state UP"; then
+                  IFACES="$IFACES -i $CAND"
+                fi
+              done
+
+              if [ -z "$IFACES" ]; then
+                echo "[zeek] WARNING: No Calico interfaces found! Falling back to -i any"
+                IFACES="any"
+              fi
+
+              LOG_DIR="${ZEEK_LOG_BASE_DIR}/${NODE_NAME}"
+              mkdir -p "$LOG_DIR"
+              echo "[zeek] Logs will be stored in: $LOG_DIR"
+
+              while true; do
+                if [ -f /shared/trigger_zeek ]; then
+                  echo "[zeek] Trigger found. Starting Zeek on $IFACES"
+                  cd "$LOG_DIR" || { echo "[zeek] ERROR: Cannot cd to $LOG_DIR"; sleep 5; continue; }
+                  zeek -p -i $IFACES &
+                  PID=$!
+                  echo "[zeek] Zeek started with PID $PID (interfaces:$IFACES)"
+
+                  while [ -f /shared/trigger_zeek ]; do sleep 1; done
+                  echo "[zeek] Trigger removed. Stopping Zeek..."
+                  kill $PID 2>/dev/null || echo "[zeek] Zeek already stopped"
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+        - name: tcpdump-sidecar
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              apk add --no-cache tcpdump
+              while true; do
+                if [ -f /shared/trigger_zeek ]; then
+                  tcpdump -i any -w /pcap/node-$(hostname)-tcp.pcapng &
+                  PID=$!
+                  while [ -f /shared/trigger_zeek ]; do sleep 1; done
+                  kill $PID
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+            - name: host-cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: host-proc
+              mountPath: /proc
+              readOnly: true
+
+        - name: ptcpdump-sidecar
+          image: quay.io/ptcpdump/ptcpdump:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[ptcpdump] Waiting for trigger file..."
+              while true; do
+                if [ -f /shared/trigger_zeek ]; then
+                  echo "[ptcpdump] Starting capture..."
+                  ptcpdump -i any -v -w /pcap/node-$(hostname)-ptcp.pcapng &
+                  PID=$!
+                  echo "[ptcpdump] Started capture with PID $PID"
+                  while [ -f /shared/trigger_zeek ]; do sleep 1; done
+                  echo "[ptcpdump] Trigger removed. Stopping capture..."
+                  kill $PID 2>/dev/null || true
+                else
+                  sleep 1
+                fi
+              done
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+            # NEW (minimal): mount node-local detached BTF files
+            - name: ptcpdump-btf
+              mountPath: /var/lib/ptcpdump/btf
+              readOnly: true
+
+      volumes:
+        - name: pcap-vol
+          persistentVolumeClaim:
+            claimName: pcap-pvc
+        - name: shared-data
+          emptyDir: {}
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+        - name: host-proc
+          hostPath:
+            path: /proc
+
+        # NEW (minimal): node path where you'll place vmlinux-$(uname -r)
+        - name: ptcpdump-btf
+          hostPath:
+            path: /var/lib/ptcpdump/btf
+            type: DirectoryOrCreate

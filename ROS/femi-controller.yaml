@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+ metadata:
+  name: controller
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: controller
+  template:
+    metadata:
+      labels:
+        app: controller
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: u1-desktop
+        kubernetes.io/arch: arm64
+
+      containers:
+        - name: controller-py
+          image: gcrilab/tb3-figure8:latest
+          imagePullPolicy: Always
+          command: ["/bin/bash", "-lc"]
+
+          env:
+            - name: TURTLEBOT3_MODEL
+              value: "burger"
+            - name: LDS_MODEL
+              value: "LDS-02"
+            - name: ROS_DOMAIN_ID
+              value: "0"
+
+            - name: RMW_IMPLEMENTATION
+              value: "rmw_cyclonedds_cpp"
+
+            - name: TRIGGER_FILE
+              value: "/shared/start_bringup"
+
+          args:
+            - |
+              set -eo pipefail
+
+              source /opt/ros/humble/setup.bash
+
+              # ======= YOU CHANGE THIS =======
+              DURATION_SEC=120
+              # ===============================
+
+              TRIGGER="/shared/trigger/run"
+              SCRIPT="/app/enhanced_fdb_eight.py"
+              LOG_DIR="/shared/logs"
+
+              mkdir -p "$(dirname "$TRIGGER")"
+              mkdir -p "$LOG_DIR"
+
+              echo "======================================"
+              echo "u1-listener loop started"
+              echo "Trigger:   $TRIGGER"
+              echo "Script:    $SCRIPT"
+              echo "Duration:  ${DURATION_SEC}s"
+              echo "Logs:      $LOG_DIR"
+              echo "======================================"
+
+              while true; do
+                if [ -f "$TRIGGER" ]; then
+                  echo "[INFO] Trigger detected at $(date)"
+
+                  mv "$TRIGGER" "/shared/trigger/run.$(date +%s)"
+
+                  echo "[INFO] Running experiment for ${DURATION_SEC}s..."
+
+                  python3 "$SCRIPT" \
+                    --ros-args \
+                    -p experiment_duration:="${DURATION_SEC}.0" \
+                    -p log_dir:="${LOG_DIR}" \
+                    || echo "[WARN] Experiment exited with error code $?"
+
+                  echo "[INFO] Finished at $(date). Back to waiting."
+                fi
+
+                sleep 0.2
+              done
+
+          volumeMounts:
+            - mountPath: /pcap
+              name: pcap-vol
+            - mountPath: /shared
+              name: shared-data
+
+            - name: script-vol
+              mountPath: /app/enhanced_fdb_eight.py
+              subPath: enhanced_fdb_eight.py
+              readOnly: true
+
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+      volumes:
+        - name: pcap-vol
+          persistentVolumeClaim:
+            claimName: pcap-pvc
+        - name: shared-data
+          emptyDir: {}
+
+        - name: script-vol
+          configMap:
+            name: figure8script

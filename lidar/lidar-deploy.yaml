@@ -1,0 +1,215 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lidar-live
+  labels:
+    app: lidar-live
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: lidar-live
+  template:
+    metadata:
+      labels:
+        app: lidar-live
+    spec:
+      hostNetwork: true
+      terminationGracePeriodSeconds: 10
+      nodeName: child1 # Pin to the lidar node via label
+
+      containers:
+        - name: lidar-input
+          image: ubuntu:20.04
+          securityContext:
+            privileged: true
+          command:
+            - bash
+            - -c
+            - |
+              apt-get update && apt-get install -y netcat pv && \
+              RECEIVER_IP=$(hostname -i) && \
+              echo "LiDAR waiting for receiver at $RECEIVER_IP:12345..."
+              while true; do
+                if nc -z $RECEIVER_IP 12345 && [ -f /shared/trigger_lidar ] && grep -q "1" /shared/trigger_lidar; then
+                  echo "Receiver ready. Streaming LiDAR..."
+                  stty -F /dev/ttyUSB0 115200 raw -echo
+                  # Buffered stream for Zeek capture
+                  cat /dev/ttyUSB0 | pv -q -L 5m | nc -N $RECEIVER_IP 12345
+                  echo "LiDAR stream complete"
+                  sleep 1
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - mountPath: /dev/ttyUSB0
+              name: ttyusb0
+              readOnly: true
+            - mountPath: /pcap
+              name: pcap-vol
+            - mountPath: /shared
+              name: shared-data
+
+        - name: lidar-publisher
+          image: ubuntu:20.04
+          command:
+            - bash
+            - -c
+            - |
+              apt-get update && apt-get install -y netcat pv && \
+              while true; do
+                if [ -f /shared/trigger_lidar ] && grep -q "1" /shared/trigger_lidar; then
+                  echo "Starting LiDAR receiver..."
+                  nc -lkp 12345 > /pcap/received_lidar-attacked-$(date +%s).txt &
+                  NC_PID=$!
+                  while [ -f /shared/trigger_lidar ] && grep -q "1" /shared/trigger_lidar; do sleep 1; done
+                  echo "Stopping receiver..."
+                  kill $NC_PID 2>/dev/null
+                  wait $NC_PID 2>/dev/null
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - mountPath: /pcap
+              name: pcap-vol
+            - mountPath: /shared
+              name: shared-data
+
+        - name: zeek-sidecar
+          image: blacktop/zeek:latest
+          securityContext:
+            privileged: true
+          env:
+            - name: ZEEK_LOG_OUTPUT_DIR
+              value: /pcap/zeek-logs-lidar
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              mkdir -p /pcap/zeek-logs-lidar
+              cd /pcap/zeek-logs-lidar
+              while true; do
+                if [ -f /shared/trigger_lidar ]; then
+                  echo "[zeek] Trigger found. Starting capture..."
+                  zeek -i any &
+                  PID=$!
+                  while [ -f /shared/trigger_lidar ]; do sleep 1; done
+                  echo "[zeek] Trigger removed. Stopping Zeek..."
+                  kill $PID || echo "[zeek] kill failed"
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - mountPath: /pcap
+              name: pcap-vol
+            - mountPath: /shared
+              name: shared-data
+
+        - name: tcpdump-sidecar
+          image: alpine:latest
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              apk add --no-cache tcpdump;
+              echo "[tcpdump] Waiting for trigger file..."
+              while true; do
+                if [ -f /shared/trigger_lidar ]; then
+                  echo "[tcpdump] Trigger found. Starting capture..."
+                  tcpdump -i any -w /pcap/pod-lidar-tcp.pcapng &
+                  PID=$!
+                  while [ -f /shared/trigger_lidar ]; do sleep 1; done
+                  echo "[tcpdump] Trigger removed. Stopping capture..."
+                  kill $PID
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+        - name: ptcpdump-sidecar
+          image: quay.io/ptcpdump/ptcpdump:latest
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[ptcpdump] Waiting for trigger file..."
+              while true; do
+                if [ -f /shared/trigger_lidar ]; then
+                  echo "[ptcpdump] Starting capture..."
+                  ptcpdump -i any -w /pcap/pod-lidar-ptcp.pcapng &
+                  PID=$!
+                  echo "[ptcpdump] Started capture with PID $PID"
+                  while [ -f /shared/trigger_lidar ]; do sleep 1; done
+                  echo "[ptcpdump] Trigger removed. Stopping capture..."
+                  kill $PID
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+        - name: lidar-replayer
+          image: ubuntu:20.04
+          securityContext:
+            privileged: true
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              apt-get update && apt-get install -y tcpdump tcpreplay coreutils procps iproute2
+              echo "[replayer] Waiting for trigger '2' in /shared/trigger_lidar..."
+
+              trap "echo '[replayer] Shutting down'; exit 0" SIGTERM
+
+              while true; do
+                if [ -f /shared/trigger_lidar ] && grep -q "^2$" /shared/trigger_lidar; then
+                  echo "[replayer] Trigger detected. Capturing 5s of traffic..."
+                  rm -f /pcap/one_second.pcap || true
+
+                  timeout 5 tcpdump -i any tcp port 12345 -w /pcap/one_second.pcap || echo "[replayer] tcpdump finished/timeout"
+
+                  if [ -s /pcap/one_second.pcap ]; then
+                    IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+                    [ -n "${IFACE:-}" ] || IFACE=$(ip -o link show | awk -F': ' '$2!="lo"{print $2; exit}')
+                    echo "[replayer] Using interface: $IFACE"
+                    timeout 5 tcpreplay --intf1="$IFACE" /pcap/one_second.pcap || echo "[replayer] tcpreplay finished/timeout"
+                    timeout 5 tcpreplay --intf1="$IFACE" /pcap/one_second.pcap || echo "[replayer] tcpreplay finished/timeout"
+                    timeout 5 tcpreplay --intf1="$IFACE" /pcap/one_second.pcap || echo "[replayer] tcpreplay finished/timeout"
+                  else
+                    echo "[replayer] No capture found. Skipping replay."
+                  fi
+                fi
+                sleep 1
+              done
+          volumeMounts:
+            - mountPath: /pcap
+              name: pcap-vol
+            - mountPath: /shared
+              name: shared-data
+
+      volumes:
+        - name: ttyusb0
+          hostPath:
+            path: /dev/ttyUSB0
+            type: CharDevice
+        - name: pcap-vol
+          persistentVolumeClaim:
+            claimName: pcap-pvc
+        - name: shared-data
+          emptyDir: {}

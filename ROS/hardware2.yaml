@@ -1,0 +1,179 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: turtlebot3
+  namespace: default
+  labels:
+    app: turtlebot3
+    component: bringup
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: turtlebot3
+      component: bringup
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: turtlebot3
+        component: bringup
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: u1-desktop
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 30
+
+      containers:
+        - name: turtlebot3-bringup
+          image: gcrilab/tb-bringup:latest
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+
+          # Keep your entrypoint if you need it; this will be overridden by args below only if entrypoint
+          # respects CMD. If /entrypoint.sh does important setup, keep command as-is.
+          command: ["/entrypoint.sh"]
+
+          env:
+            - name: TURTLEBOT3_MODEL
+              value: "burger"
+            - name: LDS_MODEL
+              value: "LDS-02"
+            - name: ROS_DOMAIN_ID
+              value: "0"
+            - name: RMW_IMPLEMENTATION
+              value: "rmw_cyclonedds_cpp"
+
+            # Start/stop trigger files (touched via kubectl exec)
+            - name: TRIGGER_FILE
+              value: "/shared/start_bringup"
+            - name: STOP_FILE
+              value: "/shared/stop_bringup"
+
+          args:
+            - bash
+            - -lc
+            - |
+              set -euo pipefail
+
+              START_FILE="${TRIGGER_FILE:-/shared/start_bringup}"
+              STOP_FILE="${STOP_FILE:-/shared/stop_bringup}"
+
+              echo "[wait] Watching for start=${START_FILE} stop=${STOP_FILE} ..."
+
+              bringup_pgid=""
+
+              start_bringup () {
+                if [[ -n "${bringup_pgid}" ]]; then
+                  echo "[bringup] already running pgid=${bringup_pgid}"
+                  return 0
+                fi
+
+                echo "[bringup] starting..."
+                # Run in its own process group so stop can signal EVERYTHING it spawns.
+                setsid bash -lc 'exec ros2 launch /launch/bringup_with_camera.launch.py' &
+                local pid="$!"
+                bringup_pgid="$pid"  # with setsid, pid is also the PGID
+                echo "[bringup] pid=${pid} pgid=${bringup_pgid}"
+              }
+
+              stop_bringup () {
+                if [[ -z "${bringup_pgid}" ]]; then
+                  echo "[bringup] not running"
+                  return 0
+                fi
+
+                if kill -0 "${bringup_pgid}" 2>/dev/null; then
+                  echo "[bringup] stopping pgid=${bringup_pgid} (SIGINT)..."
+                  kill -INT "-${bringup_pgid}" 2>/dev/null || true
+
+                  # Wait up to ~10s for clean shutdown, then escalate
+                  for _ in {1..10}; do
+                    if ! kill -0 "${bringup_pgid}" 2>/dev/null; then
+                      echo "[bringup] stopped"
+                      bringup_pgid=""
+                      return 0
+                    fi
+                    sleep 1
+                  done
+
+                  echo "[bringup] still running; escalating SIGTERM..."
+                  kill -TERM "-${bringup_pgid}" 2>/dev/null || true
+                  sleep 2
+
+                  if kill -0 "${bringup_pgid}" 2>/dev/null; then
+                    echo "[bringup] still running; escalating SIGKILL..."
+                    kill -KILL "-${bringup_pgid}" 2>/dev/null || true
+                  fi
+                fi
+
+                bringup_pgid=""
+              }
+
+              # If Kubernetes stops the container, stop bringup too
+              trap 'echo "[signal] caught termination; stopping bringup..."; stop_bringup; exit 0' TERM INT
+
+              while true; do
+                if [[ -f "${STOP_FILE}" ]]; then
+                  echo "[wait] Stop trigger found. Removing and stopping bringup..."
+                  rm -f "${STOP_FILE}"
+                  stop_bringup
+                fi
+
+                if [[ -f "${START_FILE}" ]]; then
+                  echo "[wait] Start trigger found. Removing and starting bringup..."
+                  rm -f "${START_FILE}"
+                  stop_bringup
+                  start_bringup
+                fi
+
+                if [[ -n "${bringup_pgid}" ]] && ! kill -0 "${bringup_pgid}" 2>/dev/null; then
+                  echo "[bringup] exited."
+                  bringup_pgid=""
+                fi
+
+                sleep 1
+              done
+
+          volumeMounts:
+            - name: dev-opencr
+              mountPath: /dev/ttyACM0
+            - name: dev-lidar
+              mountPath: /dev/ttyUSB0
+            - name: dev-camera
+              mountPath: /dev/video0
+            - name: shared
+              mountPath: /shared
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+
+      volumes:
+        - name: dev-opencr
+          hostPath:
+            path: /dev/ttyACM0
+            type: CharDevice
+        - name: dev-lidar
+          hostPath:
+            path: /dev/ttyUSB0
+            type: CharDevice
+        - name: dev-camera
+          hostPath:
+            path: /dev/video0
+            type: CharDevice
+        - name: shared
+          emptyDir: {}
+
+      restartPolicy: Always
