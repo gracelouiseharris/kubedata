@@ -14,19 +14,19 @@ The yaml files found in the ROS, camera, lidar, daemons, and nginx folders can b
 Each attack scenario was run for 60 seconds.
 
 Lidar attack workflow:
---Run the benign cluster for 30 seconds.
---Capture 1 second of lidar data using tcpdump
---Replay the captured data in a loop for the next 15 seconds via tcp from the attack container to the listener container.
---Return to benign traffic for 15 seconds.
+--Run the benign cluster for 30 seconds.  
+--Capture 1 second of lidar data using tcpdump.  
+--Replay the captured data in a loop for the next 15 seconds via tcp from the attack container to the listener container.  
+--Return to benign traffic for 15 seconds.  
 
 Flood attack workflow:
---Run the benign cluster for 10 seconds.
---Spin up the attacks pods.
---Wait 10 more seconds.
---20 seconds after packet capture begins: instruct one pod to flood the service for 10 seconds.
---27 seconds after packet capture begins: instruct another pod to flood the service for 4 seconds.
---45 seconds after packet capture begins: instruct another pod to flood the service for 1 second.
---47 seconds after packet capture begins: instruct the final pod to flood the service for 1 second.
+--Run the benign cluster for 10 seconds.  
+--Spin up the attacks pods.  
+--Wait 10 more seconds.  
+--20 seconds after packet capture begins: instruct one pod to flood the service for 10 seconds.  
+--27 seconds after packet capture begins: instruct another pod to flood the service for 4 seconds.  
+--45 seconds after packet capture begins: instruct another pod to flood the service for 1 second.  
+--47 seconds after packet capture begins: instruct the final pod to flood the service for 1 second.  
 
 Inject attack workflow:
 
