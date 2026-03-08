@@ -1,0 +1,188 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-live
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 8.8.4.4
+      containers:
+        - name: nginx-main
+          image: nginx:latest
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+        - name: zeek-sidecar
+          image: zeek/zeek:latest
+          securityContext:
+            privileged: true
+          env:
+            - name: ZEEK_LOG_OUTPUT_DIR
+              value: /pcap/zeek-logs-nginx
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[zeek] Waiting for trigger file to start live capture..."
+              mkdir -p /pcap/zeek-logs-nginx
+              cd /pcap/zeek-logs-nginx
+              while true; do
+                if [ -f /shared/tcpdump_enable ]; then
+                  echo "[zeek] Trigger found. Starting Zeek live capture..."
+                  zeek -C -i any &
+                  PID=$!
+                  echo "[zeek] Zeek started with PID $PID"
+                  while [ -f /shared/tcpdump_enable ]; do sleep 1; done
+                  echo "[zeek] Trigger removed. Stopping Zeek..."
+                  kill $PID || echo "[zeek] kill failed or already stopped"
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+        - name: tcpdump-sidecar
+          image: alpine:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              apk add --no-cache tcpdump;
+              echo "[tcpdump] Waiting for trigger file..."
+              while true; do
+                if [ -f /shared/tcpdump_enable ]; then
+                  echo "[tcpdump] Trigger found. Starting capture..."
+                  tcpdump -i any -w /pcap/pod-nginx-tcp.pcapng &
+                  PID=$!
+                  while [ -f /shared/tcpdump_enable ]; do sleep 1; done
+                  echo "[tcpdump] Trigger removed. Stopping capture..."
+                  kill $PID
+                else
+                  sleep 1
+                fi
+              done
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+        - name: ptcpdump-sidecar
+          image: quay.io/ptcpdump/ptcpdump:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[ptcpdump] Waiting for trigger file..."
+              while true; do
+                if [ -f /shared/tcpdump_enable ]; then
+                  echo "[ptcpdump] Starting capture..."
+                  ptcpdump -i any -v -w /pcap/pod-nginx-ptcp.pcapng &
+                  PID=$!
+                  echo "[ptcpdump] Started capture with PID $PID"
+                  while [ -f /shared/tcpdump_enable ]; do sleep 1; done
+                  echo "[ptcpdump] Trigger removed. Stopping capture..."
+                  kill $PID
+                else
+                  sleep 1
+                fi
+              done
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+        # ✅ NEW: nmap sidecar
+        - name: nmap-sidecar
+          image: alpine:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache nmap
+              echo "[nmap] Installed: $(nmap --version | head -n 1)"
+              echo "[nmap] Waiting for trigger file /shared/nmap_enable ..."
+              mkdir -p /pcap/nmap
+              while true; do
+                if [ -f /shared/nmap_enable ]; then
+                  TS="$(date +%Y%m%d-%H%M%S)"
+                  echo "[nmap] Trigger found. Running scan..."
+                  # Basic, low-impact TCP connect scan against the service DNS name
+                  nmap -sS -Pn -p- nginx-service \
+                    -oN "/pcap/nmap/nmap-${TS}.txt" \
+                    -oX "/pcap/nmap/nmap-${TS}.xml" || true
+                  echo "[nmap] Scan complete. Remove /shared/nmap_enable to stop re-scanning."
+                  # Only scan once per trigger unless you want repeated scans
+                  while [ -f /shared/nmap_enable ]; do sleep 1; done
+                  echo "[nmap] Trigger removed."
+                else
+                  sleep 1
+                fi
+              done
+          volumeMounts:
+            - name: pcap-vol
+              mountPath: /pcap
+            - name: shared-data
+              mountPath: /shared
+
+        - name: traffic-generator
+          image: python:3.11-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eux
+              echo "[traffic] Installing dependencies..."
+              apt update && apt install -y curl iputils-ping dnsutils netcat-openbsd
+              pip install requests
+              echo "[traffic] Starting traffic-random-new.py..."
+              ls -l /scripts
+              python -u /scripts/traffic-random-new.py
+          volumeMounts:
+            - name: shared-data
+              mountPath: /shared
+            - name: script-vol
+              mountPath: /scripts
+
+      volumes:
+        - name: pcap-vol
+          persistentVolumeClaim:
+            claimName: pcap-pvc
+        - name: shared-data
+          emptyDir: {}
+        - name: script-vol
+          configMap:
+            name: traffic-script-random-new
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+spec:
+  selector:
+    app: nginx
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: NodePort
